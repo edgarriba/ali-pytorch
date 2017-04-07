@@ -33,11 +33,10 @@ class CNN(nn.Module):
                     nn.BatchNorm2d(out_feat))
                 num += 1
             # add dropout layer
-            if dp > 0.0:
-                main.add_module(
-                    '{0}.pyramid.{1}-{2}.dropout'.format(num, in_feat, out_feat),
-                    nn.Dropout2d(p=dp))
-                num += 1
+            main.add_module(
+                '{0}.pyramid.{1}-{2}.dropout'.format(num, in_feat, out_feat),
+                nn.Dropout2d(p=dp))
+            num += 1
             # add activation
             if h == 'leaky_relu':
                 main.add_module(
