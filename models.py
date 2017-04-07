@@ -18,11 +18,11 @@ class CNN(nn.Module):
             if op == 'conv2d':
                 main.add_module(
                     '{0}.pyramid.{1}-{2}.conv'.format(num, in_feat, out_feat),
-                    nn.Conv2d(in_feat, out_feat, k, s, 0, bias=True))
+                    nn.Conv2d(in_feat, out_feat, k, s, 0, bias=False))
             elif op == 'convt2d':
                 main.add_module(
                     '{0}.pyramid.{1}-{2}.convt'.format(num,in_feat, out_feat),
-                    nn.ConvTranspose2d(in_feat, out_feat, k, s, 0, bias=True))
+                    nn.ConvTranspose2d(in_feat, out_feat, k, s, 0, bias=False))
             else:
                 raise Exception('Not supported operation: {0}'.format(op))
             num += 1
@@ -33,10 +33,11 @@ class CNN(nn.Module):
                     nn.BatchNorm2d(out_feat))
                 num += 1
             # add dropout layer
-            main.add_module(
-                '{0}.pyramid.{1}-{2}.dropout'.format(num, in_feat, out_feat),
-                nn.Dropout2d(p=dp))
-            num += 1
+            if dp > 0.0:
+                main.add_module(
+                    '{0}.pyramid.{1}-{2}.dropout'.format(num, in_feat, out_feat),
+                    nn.Dropout2d(p=dp))
+                num += 1
             # add activation
             if h == 'leaky_relu':
                 main.add_module(

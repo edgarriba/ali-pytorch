@@ -74,8 +74,8 @@ xp = logger.Experiment('xp_name', use_visdom=True, visdom_opts=visdom_opts)
 xp.log_config(hyperparameters)
 # create parent metric for training metrics (easier interface)
 train_metrics = xp.ParentWrapper(tag='train', name='parent',
-                                 children=(xp.AvgMetric(name='loss1'),
-                                           xp.AvgMetric(name='loss2')))
+                                 children=(xp.AvgMetric(name='lossD'),
+                                           xp.AvgMetric(name='lossG')))
 
 if torch.cuda.is_available() and not opt.cuda:
     print("WARNING: You have a CUDA device, so you should probably run with --cuda")
@@ -103,7 +103,7 @@ ngpu = int(opt.ngpu)  # number of GPUs
 nc = int(opt.nc)  # number input channels
 nz = int(opt.nz)  # latent space size
 
-eps = 1e-15  # to avoid possible NaN/Inf during backward
+eps = 1e-15  # to avoid possible numerical instabilities during backward
 
 # create models and load parameters if needed
 netGx, netGz, netDx, netDz, netDxz = ali.create_models(opt.dataset, nz, ngpu)
@@ -131,13 +131,14 @@ print(netDxz)
 # setup input tensors
 x = torch.FloatTensor(opt.batch_size, nc, opt.image_size, opt.image_size)
 z = torch.FloatTensor(opt.batch_size, nz, 1, 1)
+noise = torch.FloatTensor(opt.batch_size, 1, 1, 1)
 
 if opt.cuda:
     netGx.cuda(), netGz.cuda()
     netDx.cuda(), netDz.cuda(), netDxz.cuda()
-    x, z = x.cuda(), z.cuda()
+    x, z, noise = x.cuda(), z.cuda(), noise.cuda()
 
-x, z = Variable(x), Variable(z)
+x, z, noise = Variable(x), Variable(z), Variable(noise)
 
 # setup optimizer
 dis_params = chain(netDx.parameters(), netDz.parameters(), netDxz.parameters())
@@ -146,6 +147,10 @@ gen_params = chain(netGx.parameters(), netGz.parameters())
 kwargs_adam = {'lr': opt.lr, 'betas': (opt.beta1, opt.beta2)}
 optimizerD = optim.Adam(dis_params, **kwargs_adam)
 optimizerG = optim.Adam(gen_params, **kwargs_adam)
+
+
+def softplus(_x):
+    return torch.log(1.0 + torch.exp(_x))
 
 
 def train(dataloader, epoch):
@@ -160,50 +165,53 @@ def train(dataloader, epoch):
         batch_size = real_cpu.size(0)
         x.data.resize_(real_cpu.size()).copy_(real_cpu)
 
-        # clamp parameters to a cube
-        for p in netDx.parameters():
-            p.data.clamp_(opt.clamp_lower, opt.clamp_upper)
-        for p in netDz.parameters():
-            p.data.clamp_(opt.clamp_lower, opt.clamp_upper)
-        for p in netDxz.parameters():
-            p.data.clamp_(opt.clamp_lower, opt.clamp_upper)
-
         # init gradients
         netDz.zero_grad(), netDx.zero_grad(), netDxz.zero_grad()
-        # netGx.zero_grad(), netGz.zero_grad()
+        netGx.zero_grad(), netGz.zero_grad()
 
         # generate random data
-        z.data.resize_(batch_size, nz, 1, 1)
-        z.data.normal_(0, 1)
-        epsilon = np.random.normal(0, 1)
+        z.data.resize_(batch_size, nz, 1, 1).normal_(0, 1)
+        noise.data.resize_(batch_size, 1, 1, 1).normal_(0, 1)
 
         # equation (2) from the paper
         # q(z | x) = N(mu(x), sigma^2(x) I)
         z_hat = netGz(x)
-        mu, log_sigma = z_hat[:, :opt.nz], z_hat[:, opt.nz:]
-        sigma = log_sigma.exp()
+        mu, sigma = z_hat[:, :opt.nz], z_hat[:, opt.nz:].exp()
 
-        z_hat = mu + sigma * epsilon
+        z_hat = mu + sigma * noise.expand_as(sigma)
         x_hat = netGx(z)
 
-        # train discriminator
+        '''
+        # first approach following paper algorithm
         p_q = netDxz(torch.cat([netDx(x), netDz(z_hat)], 1))
         p_p = netDxz(torch.cat([netDx(x_hat), netDz(z)], 1))
 
+        # train discriminator
         D_loss = - torch.mean(torch.log(p_q + eps)) - torch.mean(torch.log(1 - p_p + eps))
-        D_loss.backward()  # Backpropagate loss
-        optimizerD.step()  # Apply optimization step
-
-        # init gradients
-        # netDz.zero_grad(), netDx.zero_grad(), netDxz.zero_grad()
-        netGx.zero_grad(), netGz.zero_grad()
+        D_loss.backward(retain_variables=True)  # Backpropagate loss
 
         # train generator
-        p_q = netDxz(torch.cat([netDx(x), netDz(z_hat.detach())], 1))
-        p_p = netDxz(torch.cat([netDx(x_hat.detach()), netDz(z)], 1))
-
         G_loss = - torch.mean(torch.log(1 - p_q + eps)) - torch.mean(torch.log(p_p + eps))
         G_loss.backward()  # Backpropagate loss
+
+        optimizerD.step()  # Apply optimization step
+        optimizerG.step()  # Apply optimization step'''
+
+        # approach following theano code
+        input_x = torch.cat([x, x_hat], 0)
+        input_z = torch.cat([z_hat, z], 0)
+
+        dxz = netDxz(torch.cat([netDx(input_x), netDz(input_z)], 1))
+
+        data_preds, sample_preds = dxz[:x.size(0)], dxz[x.size(0):]
+
+        D_loss = torch.mean(softplus(-data_preds + eps) + softplus(sample_preds + eps))
+        D_loss.backward(retain_variables=True)  # Backpropagate loss
+
+        G_loss = torch.mean(softplus(data_preds + eps) + softplus(-sample_preds + eps))
+        G_loss.backward()  # Backpropagate loss
+
+        optimizerD.step()  # Apply optimization step
         optimizerG.step()  # Apply optimization step
 
         ############################
@@ -215,11 +223,13 @@ def train(dataloader, epoch):
                       D_loss.data[0], G_loss.data[0]))
 
         # TODO(edgarriba): fixme since raises cuda out of memory
-        # train_metrics.update(loss1=D_loss, loss2=G_loss, n=len(real_cpu))
+        train_metrics.update(lossD=D_loss.data.cpu().numpy()[0],
+                             lossG=G_loss.data.cpu().numpy()[0],
+                             n=len(real_cpu))
 
     # Method 2 for logging: log Parent wrapper
     # (automatically logs all children)
-    # xp.log_metric(train_metrics)
+    xp.log_metric(train_metrics)
 
 
 def test(dataloader, epoch):
@@ -233,7 +243,8 @@ def test(dataloader, epoch):
 
     # removes last sigmoid activation to visualize reconstruction correctly
     mu, sigma = latent[:, :opt.nz], latent[:, opt.nz:].exp()
-    recon = nn.Sequential(*list(netGx.main.children())[:-1])(mu + sigma)
+    # recon = nn.Sequential(*list(netGx.main.children())[:-1])(mu + sigma)
+    recon = netGx(mu + sigma)
 
     vutils.save_image(recon.data, '{0}/reconstruction.png'.format(opt.experiment))
     vutils.save_image(real_cpu_first, '{0}/real_samples.png'.format(opt.experiment))
