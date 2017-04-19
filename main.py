@@ -28,6 +28,8 @@ parser.add_argument('--epochs', type=int, default=10, help='number of epochs to 
 parser.add_argument('--lr', type=float, default=1e-4, help='learning rate for optimizer, default=0.00005')
 parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam. default=0.5')
 parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for adam. default=0.999')
+parser.add_argument('--leaky', type=float, default=0.01, help='leaky relu slope, default=0.01')
+parser.add_argument('--std', type=float, default=0.01, help='standard deviation for weights init, default=0.01')
 parser.add_argument('--cuda', action='store_true', help='enables cuda')
 parser.add_argument('--ngpu', type=int, default=1, help='number of GPUs to use')
 parser.add_argument('--gpu-id', default='0', type=str, help='id(s) for CUDA_VISIBLE_DEVICES')
@@ -153,6 +155,26 @@ def softplus(_x):
     return torch.log(1.0 + torch.exp(_x))
 
 
+def compute_loss(batch_size, d_loss=False):
+    z_hat = netGz(x)
+    mu, sigma = z_hat[:, :opt.nz], z_hat[:, opt.nz:].exp()
+
+    z_hat = mu + sigma * noise.expand_as(sigma)
+    x_hat = netGx(z)
+
+    data_preds = netDxz(torch.cat([netDx(x), netDz(z_hat)], 1)) + eps
+    sample_preds = netDxz(torch.cat([netDx(x_hat), netDz(z)], 1)) + eps
+
+    if d_loss:
+        # discriminator loss
+        loss = torch.mean(softplus(-data_preds) + softplus(sample_preds))
+    else:
+        # generator loss
+        loss = torch.mean(softplus(data_preds) + softplus(-sample_preds))
+
+    return loss
+
+
 def train(dataloader, epoch):
     # Set the networks in train mode (apply dropout when needed)
     netDx.train(), netDz.train(), netDxz.train()
@@ -165,53 +187,101 @@ def train(dataloader, epoch):
         batch_size = real_cpu.size(0)
         x.data.resize_(real_cpu.size()).copy_(real_cpu)
 
-        # init gradients
-        netDz.zero_grad(), netDx.zero_grad(), netDxz.zero_grad()
-        netGx.zero_grad(), netGz.zero_grad()
-
         # generate random data
-        z.data.resize_(batch_size, nz, 1, 1).normal_(0, 1)
-        noise.data.resize_(batch_size, 1, 1, 1).normal_(0, 1)
+        rndm_args = {'mean': 0, 'std': 1}
+        z.data.resize_(batch_size, nz, 1, 1).normal_(**rndm_args)
+        noise.data.resize_(batch_size, 1, 1, 1).normal_(**rndm_args)
+
+        # clamp parameters to a cube
+        '''for p in netDx.parameters():
+            p.data.clamp_(opt.clamp_lower, opt.clamp_upper)
+        for p in netDz.parameters():
+            p.data.clamp_(opt.clamp_lower, opt.clamp_upper)
+        for p in netDxz.parameters():
+            p.data.clamp_(opt.clamp_lower, opt.clamp_upper)
+        for p in netGx.parameters():
+            p.data.clamp_(opt.clamp_lower, opt.clamp_upper)
+        for p in netGz.parameters():
+            p.data.clamp_(opt.clamp_lower, opt.clamp_upper)'''
 
         # equation (2) from the paper
         # q(z | x) = N(mu(x), sigma^2(x) I)
-        z_hat = netGz(x)
+        '''z_hat = netGz(x)
         mu, sigma = z_hat[:, :opt.nz], z_hat[:, opt.nz:].exp()
 
         z_hat = mu + sigma * noise.expand_as(sigma)
         x_hat = netGx(z)
 
-        '''
-        # first approach following paper algorithm
-        p_q = netDxz(torch.cat([netDx(x), netDz(z_hat)], 1))
-        p_p = netDxz(torch.cat([netDx(x_hat), netDz(z)], 1))
-
-        # train discriminator
-        D_loss = - torch.mean(torch.log(p_q + eps)) - torch.mean(torch.log(1 - p_p + eps))
-        D_loss.backward(retain_variables=True)  # Backpropagate loss
-
-        # train generator
-        G_loss = - torch.mean(torch.log(1 - p_q + eps)) - torch.mean(torch.log(p_p + eps))
-        G_loss.backward()  # Backpropagate loss
-
-        optimizerD.step()  # Apply optimization step
-        optimizerG.step()  # Apply optimization step'''
-
         # approach following theano code
-        input_x = torch.cat([x, x_hat], 0)
-        input_z = torch.cat([z_hat, z], 0)
+        #input_x = torch.cat([x, x_hat], 0)
+        #input_z = torch.cat([z_hat, z], 0)
 
-        dxz = netDxz(torch.cat([netDx(input_x), netDz(input_z)], 1))
+     #   dxz = netDxz(torch.cat([netDx(input_x), netDz(input_z)], 1)) + eps
 
-        data_preds, sample_preds = dxz[:x.size(0)], dxz[x.size(0):]
+     #   data_preds = dxz[:x.size(0)]
+     #   sample_preds = dxz[x.size(0):]
 
-        D_loss = torch.mean(softplus(-data_preds + eps) + softplus(sample_preds + eps))
+        data_preds = netDxz(torch.cat([netDx(x), netDz(z_hat)], 1)) +eps
+        sample_preds = netDxz(torch.cat([netDx(x_hat), netDz(z)], 1)) +eps
+
+        #netDz.zero_grad(), netDx.zero_grad(), netDxz.zero_grad()
+
+
+        #D_loss = torch.mean(softplus(-data_preds) + softplus(sample_preds))
+        D_loss = torch.mean(nn.Softplus()(-data_preds) + nn.Softplus()(sample_preds))
+        optimizerD.zero_grad()
+        netDz.zero_grad(), netDx.zero_grad(), netDxz.zero_grad()
         D_loss.backward(retain_variables=True)  # Backpropagate loss
-
-        G_loss = torch.mean(softplus(data_preds + eps) + softplus(-sample_preds + eps))
-        G_loss.backward()  # Backpropagate loss
-
         optimizerD.step()  # Apply optimization step
+
+        #netDz.zero_grad(), netDx.zero_grad(), netDxz.zero_grad()
+        #netGx.zero_grad(), netGz.zero_grad()
+
+        #netGx.zero_grad(), netGz.zero_grad()
+
+        G_loss = torch.mean(nn.Softplus()(data_preds) + nn.Softplus()(-sample_preds))
+        optimizerG.zero_grad()
+        netGx.zero_grad(), netGz.zero_grad()
+        G_loss.backward()  # Backpropagate loss
+        optimizerG.step()  # Apply optimization step
+
+        #Loss = D_loss + G_loss
+        #Loss.backward()
+
+        #optimizerD.step()  # Apply optimization step
+        #optimizerG.step()  # Apply optimization step'''
+
+        D_loss = compute_loss(batch_size, d_loss=True)
+        G_loss = compute_loss(batch_size, d_loss=False)
+
+        for p in netGx.parameters():
+            p.requires_grad = False  # to avoid computation 
+        for p in netGz.parameters():
+            p.requires_grad = False  # to avoid computation
+        for p in netDx.parameters():
+            p.requires_grad = True  # to avoid computation
+        for p in netDz.parameters():
+            p.requires_grad = True  # to avoid computation
+        for p in netDxz.parameters():
+            p.requires_grad = True  # to avoid computation
+
+        optimizerD.zero_grad()
+        D_loss.backward()
+        optimizerD.step()  # Apply optimization step
+
+        for p in netGx.parameters():
+            p.requires_grad = True  # to avoid computation
+        for p in netGz.parameters():
+            p.requires_grad = True  # to avoid computation
+        for p in netDx.parameters():
+            p.requires_grad = False  # to avoid computation
+        for p in netDz.parameters():
+            p.requires_grad = False  # to avoid computation
+        for p in netDxz.parameters():
+            p.requires_grad = False  # to avoid computation
+
+        optimizerG.zero_grad()
+        G_loss.backward()
         optimizerG.step()  # Apply optimization step
 
         ############################
@@ -234,6 +304,7 @@ def train(dataloader, epoch):
 
 def test(dataloader, epoch):
     real_cpu_first, _ = iter(dataloader).next()
+    real_cpu_first = real_cpu_first.mul(0.5).add(0.5)  # denormalize
 
     if opt.cuda:
         real_cpu_first = real_cpu_first.cuda()
@@ -243,7 +314,6 @@ def test(dataloader, epoch):
 
     # removes last sigmoid activation to visualize reconstruction correctly
     mu, sigma = latent[:, :opt.nz], latent[:, opt.nz:].exp()
-    # recon = nn.Sequential(*list(netGx.main.children())[:-1])(mu + sigma)
     recon = netGx(mu + sigma)
 
     vutils.save_image(recon.data, '{0}/reconstruction.png'.format(opt.experiment))
